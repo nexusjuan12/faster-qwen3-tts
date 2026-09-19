@@ -68,6 +68,7 @@ tts_model = None
 voices: dict = {}
 default_voice: Optional[str] = None
 SAMPLE_RATE = 24000  # updated once the model loads
+BACKEND = "torch"
 _model_lock = threading.Lock()  # prevent concurrent GPU inference
 
 # ---------------------------------------------------------------------------
@@ -185,7 +186,9 @@ async def _stream_chunks(voice_cfg: dict, text: str) -> AsyncGenerator[bytes, No
                     ref_audio=voice_cfg["ref_audio"],
                     ref_text=voice_cfg.get("ref_text", ""),
                     chunk_size=voice_cfg.get("chunk_size", 12),
-                    non_streaming_mode=False,
+                    # qwentts.cpp streams natively but does not support the
+                    # Torch backend's step-by-step text feeding switch.
+                    non_streaming_mode=False if BACKEND == "torch" else True,
                 ):
                     q.put(chunk)
         except Exception as exc:
@@ -213,7 +216,13 @@ async def _stream_chunks(voice_cfg: dict, text: str) -> AsyncGenerator[bytes, No
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "model_loaded": tts_model is not None}
+    return {
+        "status": "ok",
+        "model_loaded": tts_model is not None,
+        "backend": BACKEND,
+        "sample_rate": SAMPLE_RATE,
+        "voices": list(voices),
+    }
 
 
 @app.post("/v1/audio/speech")
@@ -306,11 +315,39 @@ def _parse_args():
     p.add_argument("--host", default="0.0.0.0", help="Bind host (default: 0.0.0.0)")
     p.add_argument("--port", type=int, default=8000, help="Bind port (default: 8000)")
     p.add_argument("--device", default="cuda", help="Torch device (default: cuda)")
+    p.add_argument(
+        "--backend",
+        choices=["torch", "ggml"],
+        default=os.environ.get("QWEN_TTS_BACKEND", "torch"),
+        help="Inference backend (default: torch)",
+    )
+    p.add_argument(
+        "--quant",
+        default=os.environ.get("QWEN_TTS_GGML_QUANT", "BF16"),
+        help="GGUF quantization when --backend=ggml (default: BF16)",
+    )
+    p.add_argument(
+        "--qwentts-no-fa",
+        action="store_true",
+        default=os.environ.get("QWEN_TTS_QWENTTS_NO_FA", "").lower() in {"1", "true", "yes"},
+        help="Disable qwentts.cpp flash-attention kernels",
+    )
+    p.add_argument(
+        "--qwentts-clamp-fp16",
+        action="store_true",
+        default=os.environ.get("QWEN_TTS_QWENTTS_CLAMP_FP16", "").lower() in {"1", "true", "yes"},
+        help="Enable qwentts.cpp FP16 clamping",
+    )
+    p.add_argument(
+        "--qwentts-ref-cache-dir",
+        default=os.environ.get("QWEN_TTS_QWENTTS_REF_CACHE_DIR"),
+        help="Directory for cached GGML .spk/.rvq voice references",
+    )
     return p.parse_args()
 
 
 def main():
-    global tts_model, voices, default_voice, SAMPLE_RATE
+    global tts_model, voices, default_voice, SAMPLE_RATE, BACKEND
 
     args = _parse_args()
 
@@ -339,12 +376,21 @@ def main():
 
     from faster_qwen3_tts import FasterQwen3TTS
 
-    logger.info("Loading model %s on %s …", args.model, args.device)
-    tts_model = FasterQwen3TTS.from_pretrained(
-        args.model,
-        device=args.device,
-        dtype=torch.bfloat16,
-    )
+    BACKEND = args.backend
+    logger.info("Loading model %s on %s using %s …", args.model, args.device, args.backend)
+    model_kwargs = {"device": args.device, "backend": args.backend}
+    if args.backend == "ggml":
+        model_kwargs.update(
+            {
+                "quant": args.quant,
+                "qwentts_use_fa": not args.qwentts_no_fa,
+                "qwentts_clamp_fp16": args.qwentts_clamp_fp16,
+                "qwentts_ref_cache_dir": args.qwentts_ref_cache_dir,
+            }
+        )
+    else:
+        model_kwargs["dtype"] = torch.bfloat16
+    tts_model = FasterQwen3TTS.from_pretrained(args.model, **model_kwargs)
     SAMPLE_RATE = tts_model.sample_rate
     logger.info("Model ready. Sample rate: %d Hz", SAMPLE_RATE)
     logger.info("Server listening on http://%s:%d", args.host, args.port)

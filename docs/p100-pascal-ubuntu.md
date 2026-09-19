@@ -95,6 +95,26 @@ tested configuration:
 The first reference upload creates cached `.spk` and `.rvq` files in
 `.qwentts_refs`; later requests reuse them.
 
+## OpenAI-compatible TTS endpoint
+
+Start the P100-configured API server with:
+
+```bash
+./launch-openai-tts-api.sh
+```
+
+It binds only to `127.0.0.1:8000` and exposes `POST /v1/audio/speech` plus
+`GET /health`. The bundled voice is named `default`; unknown voice names fall
+back to it. WAV and PCM are streamed, while MP3 is returned once encoding is
+complete.
+
+```bash
+curl http://127.0.0.1:8000/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"tts-1","input":"Hey guys, how do I sound?","voice":"default","response_format":"wav"}' \
+  --output response.wav
+```
+
 ## Known results and limitations
 
 On the P100, Q8_0 generated 11.36 seconds of speech in 11.50 seconds, with a
