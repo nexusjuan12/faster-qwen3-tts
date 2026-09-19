@@ -41,15 +41,18 @@ import json
 import logging
 import os
 import queue
+import re
 import struct
 import sys
 import threading
+import uuid
+from pathlib import Path
 from typing import AsyncGenerator, Optional
 
 import numpy as np
 import torch
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 
@@ -70,6 +73,15 @@ default_voice: Optional[str] = None
 SAMPLE_RATE = 24000  # updated once the model loads
 BACKEND = "torch"
 _model_lock = threading.Lock()  # prevent concurrent GPU inference
+_voice_registry_lock = threading.RLock()
+MANAGED_VOICE_DIR: Optional[Path] = None
+MANAGED_VOICE_REGISTRY: Optional[Path] = None
+managed_voice_metadata: dict[str, dict] = {}
+_VOICE_ID_RE = re.compile(r"^voice-[0-9a-f-]{36}$")
+_ALLOWED_VOICE_SUFFIXES = {".wav", ".mp3", ".ogg", ".flac"}
+_MAX_VOICE_SAMPLE_BYTES = 25 * 1024 * 1024
+_MIN_VOICE_SAMPLE_SECONDS = 2
+_MAX_VOICE_SAMPLE_SECONDS = 180
 
 # ---------------------------------------------------------------------------
 # Request / response models
@@ -162,6 +174,73 @@ def resolve_voice(voice_name: str) -> dict:
             f"Available voices: {list(voices.keys())}"
         ),
     )
+
+
+def _managed_audio_path(voice_id: str) -> Path:
+    if MANAGED_VOICE_DIR is None:
+        raise HTTPException(status_code=503, detail="Managed voice storage is unavailable")
+    return MANAGED_VOICE_DIR / f"{voice_id}.wav"
+
+
+def _persist_managed_voices() -> None:
+    """Atomically persist only provider-managed profiles, never built-in voices."""
+    if MANAGED_VOICE_REGISTRY is None:
+        raise RuntimeError("Managed voice registry is not configured")
+    temporary = MANAGED_VOICE_REGISTRY.with_suffix(".tmp")
+    temporary.write_text(json.dumps(managed_voice_metadata, indent=2, sort_keys=True))
+    os.chmod(temporary, 0o600)
+    temporary.replace(MANAGED_VOICE_REGISTRY)
+
+
+def _load_managed_voices() -> None:
+    """Restore managed profiles whose canonical audio files still exist."""
+    if MANAGED_VOICE_DIR is None or MANAGED_VOICE_REGISTRY is None:
+        return
+    MANAGED_VOICE_DIR.mkdir(parents=True, exist_ok=True)
+    if not MANAGED_VOICE_REGISTRY.is_file():
+        return
+    try:
+        stored = json.loads(MANAGED_VOICE_REGISTRY.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("Ignoring unreadable managed voice registry: %s", exc)
+        return
+    if not isinstance(stored, dict):
+        logger.warning("Ignoring invalid managed voice registry")
+        return
+    for voice_id, metadata in stored.items():
+        if not _VOICE_ID_RE.fullmatch(voice_id) or not isinstance(metadata, dict):
+            continue
+        audio_path = _managed_audio_path(voice_id)
+        reference_text = str(metadata.get("reference_text", "")).strip()
+        if not audio_path.is_file() or not reference_text:
+            continue
+        managed_voice_metadata[voice_id] = {
+            "display_name": str(metadata.get("display_name", voice_id))[:100],
+            "reference_text": reference_text[:2000],
+            "language": str(metadata.get("language", "English"))[:40],
+        }
+        voices[voice_id] = {
+            "ref_audio": str(audio_path),
+            "ref_text": managed_voice_metadata[voice_id]["reference_text"],
+            "language": managed_voice_metadata[voice_id]["language"],
+        }
+    logger.info("Restored %d managed voice profile(s)", len(managed_voice_metadata))
+
+
+def _remove_managed_voice_cache(audio_path: Path) -> None:
+    """Remove this profile's local GGML speaker cache when it can be identified."""
+    if BACKEND != "ggml" or tts_model is None:
+        return
+    try:
+        from faster_qwen3_tts.ggml_backend import _load_ref_audio_24k
+
+        with _model_lock:
+            reference_audio = _load_ref_audio_24k(audio_path, append_silence=True)
+            cache_key, _metadata = tts_model._voice_ref_cache_key(reference_audio, append_silence=True)
+            for cache_path in tts_model._voice_ref_paths(cache_key):
+                cache_path.unlink(missing_ok=True)
+    except Exception as exc:
+        logger.warning("Could not remove cached reference for %s: %s", audio_path.name, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -274,6 +353,102 @@ async def create_speech(req: SpeechRequest):
     return StreamingResponse(audio_stream(), media_type=content_type)
 
 
+@app.post("/v1/voices", status_code=201)
+async def create_voice(
+    sample: UploadFile = File(...),
+    reference_text: str = Form(...),
+    display_name: str = Form(...),
+    language: str = Form("English"),
+):
+    """Register a consented voice-clone sample for private provider use."""
+    if tts_model is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+    if MANAGED_VOICE_DIR is None:
+        raise HTTPException(status_code=503, detail="Managed voice storage is unavailable")
+    reference_text = reference_text.strip()
+    display_name = display_name.strip()
+    language = language.strip() or "English"
+    if not reference_text or not display_name:
+        raise HTTPException(status_code=400, detail="display_name and reference_text are required")
+    if len(reference_text) > 2000 or len(display_name) > 100 or len(language) > 40:
+        raise HTTPException(status_code=400, detail="Voice profile metadata is too long")
+    suffix = Path(sample.filename or "").suffix.lower()
+    if suffix not in _ALLOWED_VOICE_SUFFIXES:
+        raise HTTPException(status_code=400, detail="Supported sample formats: WAV, MP3, OGG, FLAC")
+
+    voice_id = f"voice-{uuid.uuid4()}"
+    temporary_source = MANAGED_VOICE_DIR / f".{voice_id}{suffix}"
+    canonical_audio = _managed_audio_path(voice_id)
+    total = 0
+    try:
+        with temporary_source.open("wb") as destination:
+            while chunk := await sample.read(1024 * 1024):
+                total += len(chunk)
+                if total > _MAX_VOICE_SAMPLE_BYTES:
+                    raise HTTPException(status_code=413, detail="Voice sample exceeds 25 MB")
+                destination.write(chunk)
+        if not total:
+            raise HTTPException(status_code=400, detail="Voice sample is empty")
+
+        from pydub import AudioSegment
+
+        audio = AudioSegment.from_file(temporary_source)
+        duration_seconds = len(audio) / 1000
+        if not _MIN_VOICE_SAMPLE_SECONDS <= duration_seconds <= _MAX_VOICE_SAMPLE_SECONDS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Voice samples must be {_MIN_VOICE_SAMPLE_SECONDS}-{_MAX_VOICE_SAMPLE_SECONDS} seconds",
+            )
+        audio.set_channels(1).set_frame_rate(SAMPLE_RATE).export(canonical_audio, format="wav")
+        os.chmod(canonical_audio, 0o600)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Could not prepare managed voice sample")
+        raise HTTPException(status_code=400, detail="Voice sample could not be decoded") from exc
+    finally:
+        temporary_source.unlink(missing_ok=True)
+
+    metadata = {
+        "display_name": display_name,
+        "reference_text": reference_text,
+        "language": language,
+    }
+    try:
+        with _voice_registry_lock:
+            managed_voice_metadata[voice_id] = metadata
+            voices[voice_id] = {
+                "ref_audio": str(canonical_audio),
+                "ref_text": reference_text,
+                "language": language,
+            }
+            _persist_managed_voices()
+    except Exception:
+        canonical_audio.unlink(missing_ok=True)
+        with _voice_registry_lock:
+            managed_voice_metadata.pop(voice_id, None)
+            voices.pop(voice_id, None)
+        raise
+    return {"id": voice_id, "display_name": display_name, "language": language}
+
+
+@app.delete("/v1/voices/{voice_id}", status_code=204)
+async def delete_voice(voice_id: str):
+    """Remove a provider-managed voice profile and its local cache material."""
+    if not _VOICE_ID_RE.fullmatch(voice_id):
+        raise HTTPException(status_code=404, detail="Voice profile not found")
+    with _voice_registry_lock:
+        if voice_id not in managed_voice_metadata:
+            raise HTTPException(status_code=404, detail="Voice profile not found")
+        audio_path = _managed_audio_path(voice_id)
+        _remove_managed_voice_cache(audio_path)
+        managed_voice_metadata.pop(voice_id, None)
+        voices.pop(voice_id, None)
+        _persist_managed_voices()
+    audio_path.unlink(missing_ok=True)
+    return Response(status_code=204)
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -343,11 +518,17 @@ def _parse_args():
         default=os.environ.get("QWEN_TTS_QWENTTS_REF_CACHE_DIR"),
         help="Directory for cached GGML .spk/.rvq voice references",
     )
+    p.add_argument(
+        "--managed-voice-dir",
+        default=os.environ.get("QWEN_TTS_MANAGED_VOICE_DIR", "~/.local/share/bizarre-tts/voices"),
+        help="Private directory for provider-managed voice samples and registry",
+    )
     return p.parse_args()
 
 
 def main():
     global tts_model, voices, default_voice, SAMPLE_RATE, BACKEND
+    global MANAGED_VOICE_DIR, MANAGED_VOICE_REGISTRY
 
     args = _parse_args()
 
@@ -373,6 +554,12 @@ def main():
             file=sys.stderr,
         )
         sys.exit(1)
+
+    MANAGED_VOICE_DIR = Path(args.managed_voice_dir).expanduser().resolve()
+    MANAGED_VOICE_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(MANAGED_VOICE_DIR, 0o700)
+    MANAGED_VOICE_REGISTRY = MANAGED_VOICE_DIR / "voices.json"
+    _load_managed_voices()
 
     from faster_qwen3_tts import FasterQwen3TTS
 
