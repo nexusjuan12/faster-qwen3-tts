@@ -62,6 +62,9 @@ pip install "faster-qwen3-tts[ggml]"
 See [`docs/ggml-backend.md`](docs/ggml-backend.md) for the native wrapper
 package and wheel selection details.
 
+For the tested Ubuntu/Tesla P100 (Pascal SM60) path, including a native SM60
+build and a local UI launcher, see [`docs/p100-pascal-ubuntu.md`](docs/p100-pascal-ubuntu.md).
+
 The GGML backend caches raw reference audio as qwentts.cpp `.spk` speaker
 latents plus `.rvq` acoustic latents after the first clone request. You can also
 pass precomputed references directly:

@@ -215,8 +215,13 @@ def _env_flag(name: str, default: str = "0") -> bool:
     return os.environ.get(name, default).strip().lower() not in {"0", "false", "no", "off", ""}
 
 
+QWENTTS_USE_FA = _env_flag("DEMO_QWENTTS_USE_FA", "1")
+QWENTTS_CLAMP_FP16 = _env_flag("DEMO_QWENTTS_CLAMP_FP16", "0")
 WEB_ONLY_MODE = _env_flag("DEMO_WEB_ONLY", "0")
 REQUIRE_LOGIN = _env_flag("DEMO_REQUIRE_LOGIN", "1" if WEB_ONLY_MODE else "0")
+# The public Space needs OAuth; a local UI does not.  Keeping this opt-in also
+# avoids Hugging Face Hub requiring a local `hf auth login` merely to start.
+ENABLE_HF_OAUTH = _env_flag("DEMO_ENABLE_HF_OAUTH", "1" if WEB_ONLY_MODE else "0")
 WEB_TOKEN_TTL_SECONDS = int(os.environ.get("DEMO_WEB_TOKEN_TTL_SECONDS", "7200"))
 WEB_TOKEN_HEADER = "x-fqtts-web-token"
 DAILY_FREE_REQUESTS = int(os.environ.get("DEMO_DAILY_FREE_REQUESTS", "10"))
@@ -652,8 +657,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["content-type", WEB_TOKEN_HEADER],
 )
-attach_huggingface_oauth(app)
-if OAuthError is not None:
+if ENABLE_HF_OAUTH:
+    attach_huggingface_oauth(app)
+if ENABLE_HF_OAUTH and OAuthError is not None:
     @app.exception_handler(OAuthError)
     async def oauth_error_handler(request: Request, exc) -> RedirectResponse:
         return RedirectResponse("/", status_code=303)
@@ -753,6 +759,8 @@ def _load_tts_model(model_id: str, backend: str, *, quant: str | None = None):
             {
                 "quant": ggml_quant,
                 "qwentts_ref_cache_dir": QWENTTS_REF_CACHE_DIR,
+                "qwentts_use_fa": QWENTTS_USE_FA,
+                "qwentts_clamp_fp16": QWENTTS_CLAMP_FP16,
             }
         )
     model = FasterQwen3TTS.from_pretrained(model_id, **kwargs)
