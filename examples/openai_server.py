@@ -248,6 +248,12 @@ def _remove_managed_voice_cache(audio_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _max_generation_frames(text: str) -> int:
+    """Bound runaway synthesis while leaving normal responses enough headroom."""
+    word_count = len(re.findall(r"\S+", text))
+    return min(640, max(96, 48 + word_count * 4))
+
+
 async def _stream_chunks(voice_cfg: dict, text: str) -> AsyncGenerator[bytes, None]:
     """
     Run generate_voice_clone_streaming in a background thread and yield
@@ -265,6 +271,7 @@ async def _stream_chunks(voice_cfg: dict, text: str) -> AsyncGenerator[bytes, No
                     ref_audio=voice_cfg["ref_audio"],
                     ref_text=voice_cfg.get("ref_text", ""),
                     chunk_size=voice_cfg.get("chunk_size", 12),
+                    max_new_tokens=_max_generation_frames(text),
                     # qwentts.cpp streams natively but does not support the
                     # Torch backend's step-by-step text feeding switch.
                     non_streaming_mode=False if BACKEND == "torch" else True,
@@ -337,6 +344,7 @@ async def create_speech(req: SpeechRequest):
                     language=voice_cfg.get("language", "Auto"),
                     ref_audio=voice_cfg["ref_audio"],
                     ref_text=voice_cfg.get("ref_text", ""),
+                    max_new_tokens=_max_generation_frames(req.input),
                 )
 
         audio_arrays, sr = await loop.run_in_executor(None, _generate)
